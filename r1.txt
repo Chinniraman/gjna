@@ -1,0 +1,549 @@
+Jenkins file :node("master") { 
+  stage('ansible Test Server Upgrade'){
+    ansiblePlaybook colorized: true, credentialsId: '1b985683-3116-4f67-a38b-3b6730e32ef0', installation: 'Ansible', inventory: '${WORKSPACE}/hosts/inventory', playbook: '${WORKSPACE}/GitHubTestUpgrade.yml', sudoUser: null
+    }   
+  }
+
+github upgrade:
+---
+- name: Curl Upgrade Package On GitHub Primary
+  hosts: GitHubPrimaryServer
+  tasks:
+    - name: curl the package
+      get_url:
+       url: https://github-enterprise.s3.amazonaws.com/esx/updates/github-enterprise-esx-2.12.0.pkg
+       dest: /home/admin/github-enterprise-esx-2.12.0.pkg
+
+- name: Curl Upgrade Package On GitHub Replica
+  hosts: GitHubReplServer
+  tasks:
+    - name: curl the package
+      get_url:
+        url: https://github-enterprise.s3.amazonaws.com/esx/updates/github-enterprise-esx-2.12.0.pkg
+        dest: /home/admin/github-enterprise-esx-2.12.0.pkg
+    - name: Stop Replication
+      raw: ghe-repl-stop #command to stop Replication
+      register: pwdout #output
+    - debug: var=pwdout
+
+- name: Enable Maintinence Mode
+  hosts: GitHubPrimaryServer
+  tasks:
+    - name: enable maintenance mode
+      raw: ghe-maintenance -s
+      register: pwdout
+    - debug: var=pwdout
+
+ghe - backup utils:
+
+#!/usr/bin/env bash
+# Useful for disabling backups...
+# exit 0
+
+## set path for date command (used more than once)
+DATE_BIN=/bin/date
+
+## get datestamp of dir to tar...
+TAR_STRING=`$DATE_BIN +"%Y%m%dT%H"`
+
+## define destination for tar files
+TAR_DEST=/nmlprod/github/data/tarfiles
+
+## define the path of the backup utilities
+BACKUP_UTIL_DIR=/opt/github/data/backup-utils
+
+## define the path of the backup log
+TAR_LOG_DIR=/opt/github/data/backup-utils
+
+# Add a test here, to make sure the dirs exist since they are in a mounted FS
+if [ -d $TAR_DEST ] && [ -d $TAR_LOG_DIR ]
+then
+    $DATE_BIN >> $TAR_LOG_DIR/backup.log
+    ${BACKUP_UTIL_DIR}/bin/ghe-backup -v 1 >> ${TAR_LOG_DIR}/backup.log
+    tar -cvf ${TAR_DEST}/${TAR_STRING}.tar /nmlprod/github/data/backup/${TAR_STRING}*
+    cd ${TAR_DEST}
+
+    find . -maxdepth 1 -name "*.tar" -mmin +4260 | while read aTar
+    do
+      echo "Removing ${aTar} from ${TAR_DEST}..." >> ${TAR_LOG_DIR}/backup.log
+      if [ -f ${aTar} ]
+      then
+        rm ${aTar}
+      fi
+
+    done
+    $DATE_BIN >> ${BACKUP_UTIL_DIR}/backup.log
+else
+    echo "ERROR: $TAR_DEST and/or $TAR_LOG_DIR do not exist!"
+    exit 99
+fi 
+
+
+
+#- name: Send Start Message On Slack
+#  hosts: localhost
+#  tasks:
+#    - name: Send A Message With A Link Using Slack
+#      slack:
+#        token: T08JDUYRY/B4PMX79NF/Q1UnfcefQhsbawQzKxNgyvj4
+#        msg: Github Upgrade has started, github.nml.com is now in maintenance mode
+#        color: good
+#        username: 'Github Upgrade'
+#        link_names: 0
+#        parse: 'none'
+#        channel: automationtrain
+
+- name: Upgrade Primary Instance
+  hosts: GitHubPrimaryServer
+  tasks:
+    - name: upgrade with shell
+      shell: ghe-upgrade -y /home/admin/github-enterprise-esx-2.12.0.pkg
+      async: 1
+      poll: 0
+      ignore_errors: yes
+    - wait_for:
+        host: 172.30.201.14
+        port: 122
+        delay: 60
+        state: started
+
+    - pause:
+        minutes: 6
+    - name: Disable Maintenance Mode On Primary
+      raw: ghe-maintenance -u
+      register: pwdout
+    - debug: var=pwdout
+    - pause:
+        seconds: 20
+
+#- name: Send Result Message On Slack
+#  hosts: localhost
+#  tasks:
+#    - name: Send a message with a link using Slack markup
+#      slack:
+#        token: T08JDUYRY/B4PMX79NF/Q1UnfcefQhsbawQzKxNgyvj4
+#        msg: Github Upgrade has completed, github.nml.com is now out of maintenance mode
+#        color: good
+#        username: 'Github Upgrade'
+#        link_names: 0
+#        parse: 'none'
+#        channel: automationtrain
+
+- name: Upgrade Replication Server
+  hosts: GitHubReplServer
+  tasks:
+    - name: Upgrade Replica
+      command: ghe-upgrade -y /home/admin/github-enterprise-esx-2.12.0.pkg
+      async: 1
+      poll: 0
+      ignore_errors: yes
+    - wait_for:
+        host: 172.30.201.35
+        port: 122
+        delay: 60
+        state: started
+
+    - pause:
+        minutes: 6
+
+    - name: Start Replication
+      raw: ghe-repl-start #command to start Replication
+      register: replicationout #output
+      ignore_errors: yes
+
+#    - name: Setup Replication If Needed
+#      shell: yes | ghe-repl-setup 172.29.223.55
+#      shell: ghe-repl-start
+#      when: replicationout.stdout.find("Failed to restart openvpn service on primary") != -1
+#      register: results
+#      ignore_errors: yes
+
+- name: Remove Anouncement Banner
+  hosts: GitHubPrimaryServer
+  tasks:
+    - name: Remove Banner
+      command: ghe-announce -u
+
+#-include: checkout.yml
+
+Github checkout:
+---
+- name: to checkout ssh connection to githubhook
+  hosts: GitHubPrimaryServer
+  tasks:
+    - name: connection check
+      raw: ghe-system-info
+      register: pwdout #output
+    - debug: var=pwdout
+      when: not pwdout.stdout.find('uname') != -1
+    - debug: var=pwdout.stderr
+
+- name: To check replication status
+  hosts: GitHubReplServer
+  tasks:
+    - name: to check if replication is working fine
+      raw: ghe-repl-status
+      register: replout
+
+    - debug: var=replout
+#    - debug: "{{ item }}"
+#      with_items: "{{ replout.stdout_lines }}"
+      # when:
+      #   - not replout.stdout.find('mysql replication is in sync') != -1
+      #   - not replout.stdout.find('redis replication is in sync') != -1
+      #   - not replout.stvidout.find('elasticsearch cluster is in sync') != -1
+      #   - not replout.stdout.find('git replication is in sync') != -1
+      #   - not replout.stdout.find('pages replication is in sync') != -1
+      #   - not replout.stdout.find('alambic replication is in sync') != -1
+      #   - not replout.stdout.find('git-hooks replication is in sync') != -1
+    - debug: var=replout.stderr
+
+- name: To clone a repo
+  hosts: localhost
+  # become: true
+  # become_user: jenkins
+  # # sudo: yes
+  tasks:
+    # - name: Delete directory if exists
+    #   raw: rm -rf /opt/CICD/jenkins-app/userContent/Checkout
+    #   register: delout
+      
+  
+    - debug: var=delout
+  #     # file:
+  #     #   path: Users/nag6740/Downloads/cd/github/checkoutrepo/
+  #     #   state: "{{ item }}"
+  #     #   # owner: 1000  # set your owner, group, and mode accordingly
+  #     #   # group: 1000
+  #     #   mode: '0777'
+  #     # with_items:
+  #     #   - absent
+  #     #   - directory
+  #     #   # recurse: yes
+  #   # - name: checkout a github repo and use refspec to fetch all pull requests
+    - pause:
+        seconds: 2
+    # - git:
+    #     repo: git@github.nml.com:nm/Automated-GitHub-Updates.git
+    #     dest: /opt/CICD/jenkins-app/userContent/Checkout/
+    #     # refspec: '+refs/pull/*:refs/heads/*'
+    #     # key_file: /home/mir0247/id_rsaHamzah
+    #     accept_hostkey: yes
+    #     force: yes
+
+    - name: update readme.md with current date
+      raw: echo "\n github is working, verified on " >> /opt/CICD/jenkins-app/jobs/GitHubCheckout/UpgradeVerificationDate.md
+    - name: add date
+      raw: date >> /opt/CICD/jenkins-app/jobs/GitHubCheckout/UpgradeVerificationDate.md
+
+    # - name: git add
+    #   shell: git add .
+    #   args:
+    #     chdir: /opt/CICD/jenkins-app/userContent/Checkout/
+    
+    # - name: git commit
+    #   shell: git commit -m "commit from playbook"
+    #   args:
+    #     chdir: /opt/CICD/jenkins-app/userContent/Checkout/
+    
+    # - name: git pushchanges
+    #   shell: git push
+    #   # sudo: yes
+    #   args:
+    #     chdir: /opt/CICD/jenkins-app/userContent/Checkout/
+
+Nexus LDAP:
+
+---
+
+- name: Configure nexus ldap
+  hosts: "{{ nexus_server }}"
+  remote_user: "{{ remote_user }}"
+  
+  vars:
+    nexus_server_url: "{{ nexus_server_url }}"
+ 
+  tasks:  
+    - name: Fetching credentials for Nexus server.
+      include_vars:
+        file: "secrets/credentials.yml"
+      no_log: true
+      tags:
+      - always
+
+    - name: Fetching credentials for Ldap server.
+      include_vars:
+        file: "secrets/nexus_ldap.yml"
+      no_log: true
+      tags:
+      - always       
+    
+    - name: Configure nexus ldap.
+      include_role:
+        name: upload_run_groovy
+        tasks_from: ldap_config
+      tags:
+      - setup_ldap
+
+    - name: Create nexus ldap role.
+      vars:
+        ldap_role: "LDAP"
+      include_role:
+        name: upload_run_groovy
+        tasks_from: create_roles
+      tags:
+      - create_roles   
+
+Nexus Backup rotation:
+
+---
+
+# ansible playbook to delete database exports older than 3 days
+
+- name: deleting old database backup
+  hosts: "{{host_name}}"
+  remote_user: "{{remote_user}}"
+
+  tasks:
+    - name: delete .bak files older than 3 days
+      shell: find "{{backup_location}}" -type f -name "*.bak" -mtime +3 -exec rm {} \;
+      args:
+        chdir: "{{backup_location}}"
+      #command: cd "{{backup_location}}"
+      #command: find "{{backup_location}}" -type f -name "*.bak" -mtime +3 -exec rm {} \;
+
+      #command: "{{item}}"
+      #with_items:
+      #- cd "{{backup_location}}"
+      #- find "{{backup_location}}" -type f -name "*.bak" -mtime +3 -exec rm {} \;
+
+nexus_artifacts_pull_push.yml :
+
+---
+    
+- name: Setting URL for nexus artifact - {{ nexus_artifact }}
+  set_fact:
+    nexus_url: "{{ nexus_source_server_url }}/repository/{{ nexus_repo_name }}/{{ artifact_group_id }}/{{ nexus_artifact }}"  
+
+
+- name: Pulling nexus artifact - {{ nexus_artifact }}
+  get_url:
+    url: "{{ nexus_url }}"
+    dest: "/tmp/nexus_artifacts"
+    mode: 0777
+    timeout: 100
+    force: no
+    validate_certs: False
+ 
+- name: Pushing nexus artifact - {{ nexus_artifact }}
+  shell: "curl -u {{ nexus_user }}:{{ nexus_password }} --upload-file {{ nexus_artifact }} {{ nexus_dest_server_url }}/repository/{{ nexus_repo_name }}/{{ artifact_group_id }}/{{ nexus_artifact }} -k -v --fail"
+  args: 
+    chdir: /tmp/nexus_artifacts
+  #no_log: true
+
+Nexus_setup :
+
+---
+
+- name: Setup Nexus
+  hosts: "{{ nexus_server }}"
+  remote_user: "{{ remote_user }}"
+
+  vars:
+    nexus_version: "{{ nexus_version }}"
+    nexus_upgrade_version: "{{ nexus_upgrade_version }}"
+    nexus_os_user_name: 'nexus'
+    nexus_os_group_name: 'nexusg'
+    env_type: "test"
+
+  tasks:
+  - name: Setting owner/group variable based on env type.
+    set_fact:
+      nexus_os_user_name: 'nexust'
+      nexus_os_group_name: 'nexusg'
+    when: env_type != 'prod'
+    tags:
+    - always
+
+  - name: Install Nexus.
+    include_role:
+      name: nexus_setup
+      tasks_from: nexus_install
+    tags:
+    - install
+
+  - name: Upgrade Nexus.
+    include_role:
+      name: nexus_setup
+      tasks_from: nexus_upgrade
+    tags:
+    - upgrade
+
+Nexus_nginx_config_update.yml :
+
+---
+
+# ansible playbook to update nginx config
+
+- name: update nginx config for nexus.
+  hosts: "{{ server_name }}"
+  remote_user: "{{ remote_user }}"
+
+  vars:
+    src_nginx_config_file: nexustest.nml.com.conf
+    nginx_config_path: /etc/nginx/conf.d
+    nginx_config_file: nexustest.nml.com.conf
+    owner: nexust
+    group: nexusg
+
+
+  tasks:
+
+    - name: Creating nginx config
+      template:
+        src: "config_temp/{{ src_nginx_config_file }}"
+        dest: "{{ nginx_config_path }}/{{ nginx_config_file }}"
+        owner: "{{ owner }}"
+        group: 'nexusg'
+        mode: 0644
+        backup: yes
+
+          #- name: comment header line
+          #replace:
+          #dest: /etc/nginx/conf.d/nexustest.nml.com.conf
+          #regexp: '*proxy_set_header Authorization*'
+          #replace: '#proxy_set_header Authorization'
+
+          #    - name: Test nginx configuration
+          #command: /usr/sbin/nginx -t -c /etc/nginx/conf.d/nexustest.nml.com.conf
+          #register: test_result
+
+      #    - name: Restarting nginx daemon if config test is Successfull
+      #service:
+      #name: nginx
+      #enabled: yes
+      #state: reloaded
+      #when: "'test is successful' in test_result.stderr"
+
+Nexus_cleanup.yml :
+
+---
+
+# ansible playbook to Start/Stop nexus 
+
+- name: Cleaning up Nexus
+  hosts: "{{ nexus_server }}"
+  remote_user: "{{remote_user}}"
+  
+  vars:
+    nexus_version: "{{ nexus_version }}"
+    nexus_install_loc: /opt/nexus
+    
+  tasks:
+    - name: Check for existence of Nexus.
+      stat: path="{{ nexus_install_loc }}/nexus-{{ nexus_version }}/bin/nexus"
+      register: result
+      
+    - debug:
+        msg: "Nexus not installed, Exiting..."
+      when: not result.stat.exists
+
+    - name: Exit the play if not found existing nexus installation.
+      meta: end_play
+      when: not result.stat.exists      
+      
+    - name: Checking if nexus running.
+      shell: ./nexus status
+      args:
+        chdir: "{{ nexus_install_loc }}/nexus-{{ nexus_version }}/bin/"
+      register: status
+      ignore_errors: yes
+      
+    - name: Stopping nexus.
+      shell: ./nexus stop
+      args:
+        chdir: "{{ nexus_install_loc }}/nexus-{{ nexus_version }}/bin/"
+      when: "'nexus is running' in status.stdout"
+      ignore_errors: yes
+
+    - name: Set backup time stamp
+      set_fact:
+        backup_ts: "{{lookup('pipe','date +%Y%m%d%H%M%S')}}"
+    
+    - name: Backing up nexus
+      command: cp -r /opt/nexus ~/nexus-backup@-{{ backup_ts }}
+        
+    - name: Delete Nexus "{{ nexus_version }}" directory
+      file:
+        path: "/opt/nexus/nexus-{{ nexus_version }}"
+        state: "absent"
+        
+    - name: Delete Nexus sonatype directory
+      file:
+        path: "/opt/nexus/sonatype-work"
+        state: "absent"
+      tags:
+        no_delete
+        
+    - name: Delete Nexus blobstore directory
+      file:
+        path: "/opt/nexus/nx-data"
+        state: "absent"
+      tags:
+        no_delete        
+      
+    - name: check /opt/nexus/
+      command: ls -l /opt/nexus/ 
+
+
+Nexus_start_stop.yml :
+
+---
+
+# ansible playbook to Start/Stop nexus 
+
+- name: Start/Stop Nexus
+  hosts: "{{ nexus_server }}"
+  remote_user: "{{remote_user}}"
+  
+  vars:
+    nexus_version: "{{ nexus_version }}"
+    nexus_install_loc: /opt/nexus
+    
+  tasks:
+    - name: Check for existence of Nexus.
+      stat: path="{{ nexus_install_loc }}/nexus-{{ nexus_version }}/bin/nexus"
+      register: result
+      
+    - debug:
+        msg: "Nexus not installed, Exiting..."
+      when: not result.stat.exists
+
+    - name: Exit the play if not found existing nexus installation.
+      meta: end_play
+      when: not result.stat.exists      
+      
+    - name: Checking if nexus running.
+      shell: ./nexus status
+      args:
+        chdir: "{{ nexus_install_loc }}/nexus-{{ nexus_version }}/bin/"
+      register: status
+      
+    - name: Stopping nexus.
+      shell: ./nexus stop
+      args:
+        chdir: "{{ nexus_install_loc }}/nexus-{{ nexus_version }}/bin/"
+        when: "'nexus is stopped' in status"
+
+
+
+
+
+
+
+   
+  
+
+
+
+
